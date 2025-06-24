@@ -11,7 +11,7 @@ from scipy import signal
 from scipy.optimize import curve_fit
 from scipy.ndimage import maximum_filter1d
 from miniML_functions import (get_event_peak, get_event_baseline, get_event_onset, get_event_risetime, 
-                              get_event_halfdecay_time, get_event_charge)
+                              get_event_halfdecay_time, get_event_charge, get_event_halfwidth)
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
@@ -184,8 +184,8 @@ class MiniTrace():
 
 
     @classmethod
-    def from_heka_file(cls, filename: str, rectype: str, group: int=1, exclude_series:list=[], exclude_sweeps:dict={},
-                        scaling: float=1, unit: str=None, resample: bool=True) -> MiniTrace:
+    def from_heka_file(cls, filename: str, rectype: str, group: int=0, load_series: list=[], exclude_series: list=[], 
+                       exclude_sweeps: dict={}, scaling: float=1, unit: str=None, resample: bool=True) -> MiniTrace:
         ''' Loads data from a HEKA .dat file. Name of the PGF sequence needs to be specified.
 
         Parameters
@@ -195,7 +195,10 @@ class MiniTrace():
         rectype: string
             Name of the PGF sequence in the file to be loaded.
         group: int, default=1
-            HEKA group to load data from. HEKA groups are numbered starting from 1. Defaults to 1. 
+            HEKA group to load data from. Note that HEKA groups are numbered starting from 1, but Python idexes from zero. 
+            Hence, group 1 in HEKA is group 0 in Python. 
+        load_series: list, default=[]
+            List of HEKA series to load. Uses zero-indexing, i.e. HEKA series 1 is 0 in the list.
         exclude_series: list, default=[].
             List of HEKA series to exclude.
         exclude_sweeps: dict, default={}.
@@ -204,7 +207,7 @@ class MiniTrace():
             Scaling factor applied to the data. Defaults to 1e12 (i.e. pA)
         unit: str, default=''
             Data unit, to be set when using scaling factor.
-        resample: boolean, default=True
+        resample: boolean, default=rue
             Resample data in case of sampling rate mismatch.
 
         Returns
@@ -227,7 +230,6 @@ class MiniTrace():
         import FileImport.HekaReader as heka
         bundle = heka.Bundle(filename)
 
-        group = group - 1
         if group < 0 or group > len(bundle.pul.children) - 1:
             raise IndexError('Group index out of range')
 
@@ -235,9 +237,14 @@ class MiniTrace():
         for i, SeriesRecord in enumerate(bundle.pul[group].children):
             bundle_series.update({i: SeriesRecord.Label})
 
-        series_list = [series_number for series_number, record_type in bundle_series.items() \
-                  if record_type == rectype and series_number not in exclude_series]
-        
+        if load_series == []:
+            series_list = [series_number for series_number, record_type in bundle_series.items() \
+                    if record_type == rectype and series_number not in exclude_series]
+        else:
+            load_series = [x for x in load_series if x not in exclude_series]
+            series_list = [series_number for series_number, record_type in bundle_series.items() \
+                    if record_type == rectype and series_number in load_series]
+
         series_data = []
         series_resistances = []
         for series in series_list:
@@ -275,6 +282,8 @@ class MiniTrace():
         MiniTrace.exlucded_series = exclude_series
         MiniTrace.Rseries = series_resistances
 
+        bundle.close()
+        
         return cls(data=data * scaling, sampling_interval=max_sampling_interval, 
                    y_unit=data_unit, filename=Path(filename).name)
 
@@ -350,15 +359,17 @@ class MiniTrace():
         return MiniTrace(detrended, self.sampling, y_unit=self.y_unit, filename=self.filename)
 
 
-    def filter(self, notch: float=None, highpass: float=None, lowpass: float=None, order: int=4,
+    def filter(self, line_freq: float=None, width: float=None, highpass: float=None, lowpass: float=None, order: int=4,
                savgol: float=None, hann: int=None) -> MiniTrace:
-        ''' Filters trace with a combination of notch, high- and lowpass filters.
+        ''' Filters trace with a combination of line frequency, high- and lowpass filters.
         If both lowpass and savgol arguments are passed, only the lowpass filter is applied. 
 
         Parameters
         ----------
-        notch: float, default=None
-            Notch filter frequency (Hz)
+        line_freq: float, default=None
+            Line noise filter frequency (Hz). Line noise is removed by spectrum interpolation.
+        width: float, default=None
+            Width of the line noise filter (Hz).
         highpass: float, default=None
             Highpass cutoff frequency (Hz).
         lowpass: float, default=None
@@ -378,21 +389,27 @@ class MiniTrace():
         filtered_data = self.data.copy()
         nyq = 0.5 * self.sampling_rate
 
-        if notch:
-            b_notch, a_notch = signal.iirnotch(notch, 2.0, self.sampling_rate)
-            filtered_data = signal.filtfilt(b_notch, a_notch, filtered_data)
+        if line_freq:
+            from scipy.fftpack import rfft, irfft, rfftfreq
+            fft = rfft(filtered_data)
+            xf = rfftfreq(filtered_data.shape[0], 1 / self.sampling_rate)
+            multiples = 6
+            for freq in np.arange(line_freq, (multiples * line_freq), line_freq):
+                fft[np.where(xf > freq - width/2)[0][0]:np.where(xf > freq + width/2)[0][0]] = 0
+
+            filtered_data = irfft(fft)
         if highpass:
             sos = signal.butter(order, highpass / nyq, btype='high', output='sos')
             filtered_data = signal.sosfilt(sos, filtered_data)
         if lowpass:
             if savgol:
                 print('Warning: Two lowpass filters selected, Savgol filter is ignored.')
-            sos = signal.cheby2(order, 60, lowpass / nyq, btype='low', analog=False, output='sos', fs=None)
+            sos = signal.butter(order, lowpass / nyq, btype='low', analog=False, output='sos', fs=None)
             filtered_data = signal.sosfiltfilt(sos, filtered_data)
         elif savgol:
             filtered_data = signal.savgol_filter(filtered_data, int(savgol / 1000 / self.sampling), polyorder=order)
         elif hann:
-            win = signal.windows.hann(hann)    
+            win = signal.windows.hann(hann)
             filtered_data = signal.convolve(filtered_data, win, mode='same') / sum(win)
             # Hann window generates edge artifacts due to zero-padding. Retain unfiltered data at edges.
             filtered_data[:hann] = self.data[:hann]
@@ -465,8 +482,12 @@ class EventStats():
         Charge transfer of individual events.
     risetimes: np.ndarray
         10-90 percent rise times of individual events.
+    slopes: np.ndarray
+        Rise slopes of individual events.
     halfdecays: np.ndarray
         Half decay times of individual events.
+    halfwidths: np.ndarray
+        Half-width of individual events (seconds).
     avg_tau_decay: float
         Average decay time constant (seconds).
     rec_time: float
@@ -478,12 +499,14 @@ class EventStats():
     ----------
     event_count: number of events
     '''
-    def __init__(self, amplitudes, scores, charges, risetimes, decaytimes, tau, time, unit: str) -> None:
+    def __init__(self, amplitudes, scores, charges, risetimes, slopes, decaytimes, halfwidths, tau, time, unit: str) -> None:
         self.amplitudes = amplitudes
         self.event_scores = scores
         self.charges = charges
         self.risetimes = risetimes
+        self.slopes = slopes
         self.halfdecays = decaytimes
+        self.halfwidths = halfwidths
         self.avg_tau_decay = tau
         self.rec_time = time
         self.y_unit = unit
@@ -529,6 +552,7 @@ class EventStats():
         print(f'    CV charge: {self.cv(self.charges):.3f}')
         print(f'    Mean 10-90 risetime: {self.mean(self.risetimes)*1000:.3f} ms')
         print(f'    Mean half decay time: {self.mean(self.halfdecays)*1000:.3f} ms')
+        print(f'    Mean half-width: {self.mean(self.halfwidths)*1000:.3f} ms')
         print(f'    Tau decay: {self.avg_tau_decay*1000:.3f} ms')
         print('-------------------------')
 
@@ -601,6 +625,7 @@ class EventDetection():
         elif model_path:
             self.load_model(filepath=model_path, threshold=model_threshold, compile=compile_model)
             self.callbacks = callbacks
+        self.deleted_events = 0
         
     @property
     def event_direction(self):
@@ -643,11 +668,24 @@ class EventDetection():
             print(f'Model loaded from {filepath}')
 
 
+    def lowpass_filter(self, data: np.ndarray, cutoff: float, order: int=4) -> np.ndarray:
+        '''
+        Butterworth lowpass filter. 
+        '''
+        nyq = 0.5 * self.trace.sampling_rate
+
+        sos = signal.butter(order, cutoff / nyq, btype='lowpass', analog=False, output='sos', fs=None)
+
+        return signal.sosfiltfilt(sos, data)
+    
+
     def hann_filter(self, data: np.ndarray, filter_size: int) -> np.ndarray:
         '''
         Hann window filter. Start and end of the data are not filtered to avoid artifacts
         resulting from zero padding.
         '''
+        if filter_size == 0:
+            return data
         win = signal.windows.hann(filter_size)    
         filtered_data = signal.convolve(data, win, mode='same') / sum(win)
         filtered_data[:filter_size] = data[:filter_size]
@@ -740,6 +778,9 @@ class EventDetection():
                                                prominence=self.model_threshold, width=peak_w*self.interpol_factor)
 
         start_pnts = np.array(peak_properties['left_ips'] + self.window_size/4, dtype=np.int64)
+        # check if start_pnts are larger than right_ips and limit to this value minus buffer of a quarter of peak width
+        boolean_indices = start_pnts > peak_properties['right_ips']
+        start_pnts[boolean_indices] = peak_properties['right_ips'][boolean_indices] - peak_properties['widths'][boolean_indices] / 4
         end_pnts =  np.array(peak_properties['right_ips'] + self.window_size/2, dtype=np.int64)
         scores = peak_properties['peak_heights']
 
@@ -750,13 +791,16 @@ class EventDetection():
         '''
         Generate a smoothed gradient trace of the data.
         '''
-        # filter raw data trace, calculate gradient and filter first derivative trace        
-        trace_convolved = self.hann_filter(data=self.trace.data, filter_size=self.convolve_win)
+        # filter raw data trace, calculate gradient and filter first derivative trace
+        if self.convolve_win > 0:
+            trace_convolved = self.hann_filter(data=self.trace.data, filter_size=self.convolve_win)
+        else:
+            trace_convolved = self.lowpass_filter(data=self.trace.data, cutoff=self.trace.sampling_rate / self.filter_factor, order=4)
         trace_convolved *= self.event_direction # (-1 = 'negative', 1 else)
         
         gradient = np.gradient(trace_convolved, self.trace.sampling)
-        gradient[:int(self.convolve_win * 1.5)] = 0
-        gradient[-int(self.convolve_win * 1.5):] = 0
+        # gradient[:int(self.convolve_win * 1.5)] = 0
+        # gradient[-int(self.convolve_win * 1.5):] = 0
 
         smth_gradient = self.hann_filter(data=gradient, filter_size=self.gradient_convolve_win)
         smth_gradient[:self.gradient_convolve_win] = 0
@@ -869,12 +913,18 @@ class EventDetection():
 
         if np.any(positions - add_points < 0) or np.any(positions + after >= self.trace.data.shape[0]):
             raise ValueError('Cannot extract time windows exceeding input data size.')
-
-        mini_trace = self.hann_filter(data=self.trace.data, filter_size=self.convolve_win) if filter else self.trace.data
-        mini_trace *= self.event_direction   
+        # Filter data if required
+        if filter:
+            if self.convolve_win > 0:
+                mini_trace = self.hann_filter(data=self.trace.data, filter_size=self.convolve_win)
+            else:
+                mini_trace = self.lowpass_filter(data=self.trace.data, cutoff=self.trace.sampling_rate / self.filter_factor, order=4)
+        else:
+            mini_trace = self.trace.data.copy()
+        mini_trace *= self.event_direction
 
         self._init_arrays(['event_peak_locations', 'bsl_starts', 'bsl_ends', 'event_start'], positions.shape[0], dtype=np.int64)
-        self._init_arrays(['event_peak_values', 'event_bsls', 'event_bsl_durations', 'decaytimes', 'charges', 'risetimes', 'half_decay'], positions.shape[0], dtype=np.float64)               
+        self._init_arrays(['event_peak_values', 'event_bsls', 'event_bsl_durations', 'decaytimes', 'charges', 'risetimes', 'half_decay', 'halfwidths', 'rise_half_amp_times', 'decay_half_amp_times'], positions.shape[0], dtype=np.float64)               
         self._init_arrays(['min_positions_rise', 'max_positions_rise', 'min_values_rise', 'max_values_rise'], positions.shape[0], dtype=np.float64)               
 
         for ix, position in enumerate(positions):
@@ -920,6 +970,22 @@ class EventDetection():
 
             self.half_decay[ix] = halfdecay_position
             self.decaytimes[ix] = halfdecay_time
+
+            # Calculate halfwidth and related times
+            current_amplitude = abs(self.event_peak_values[ix] - self.event_bsls[ix])
+            if self.event_direction == -1 : # event_peak_values and bsls are already inverted for negative events later, so use original direction for amplitude calc with data
+                 current_amplitude = abs(data[event_peak_pos] - baseline)
+
+            halfwidth, t_rise_half, t_decay_half = get_event_halfwidth(
+                event_data=data,
+                peak_index=event_peak_pos,
+                baseline=baseline,
+                amplitude=current_amplitude,
+                sampling_rate=self.trace.sampling_rate
+            )
+            self.halfwidths[ix] = halfwidth
+            self.rise_half_amp_times[ix] = t_rise_half
+            self.decay_half_amp_times[ix] = t_decay_half
             
             # calculate charges
             ### For charge; multiple event check done outside function.
@@ -990,6 +1056,8 @@ class EventDetection():
             self.bsl_ends[ix] = int(self.bsl_ends[ix] + self.event_locations[ix] - self.add_points)
             
             self.event_start[ix] = int(self.event_start[ix] + self.event_locations[ix] - self.add_points)
+            self.rise_half_amp_times[ix] += (self.event_locations[ix] - self.add_points) * self.trace.sampling
+            self.decay_half_amp_times[ix] += (self.event_locations[ix] - self.add_points) * self.trace.sampling
             self.min_positions_rise[ix] += (self.bsl_starts[ix] * self.trace.sampling)
             self.max_positions_rise[ix] += (self.bsl_starts[ix] * self.trace.sampling)
             
@@ -1017,18 +1085,16 @@ class EventDetection():
 
             
     def _get_average_event_properties(self) -> dict:
-        '''extracts event properties for the event average the same way the individual events are analysed'''
-        ### Prepare data
-        diffs = [int(self.window_size / 3) * 10] * 3 # Difference in points between the event locations
+        '''
+        Extract properties of the event average the same way the individual events are analysed.
+        '''
         add_points = int(self.window_size / 3)
-
-        ### Set parameters for charge calculation
-        charge_factor = 4
+        diffs = [add_points * 10] # Set right limit larger than window size
+        charge_factor = 4 # Charge window is 4 * decay time
         data = np.mean(self.events[self.singular_event_indices], axis=0) * self.event_direction
 
         event_peak = get_event_peak(data=data, event_num=0, add_points=add_points, window_size=self.window_size, diffs=diffs)
         event_peak_value = data[event_peak]
-        event_peak_value = np.mean(data[int(event_peak-self.peak_spacer):int(event_peak+self.peak_spacer)])
 
         baseline, baseline_var, bsl_start, _, _ = get_event_baseline(data=data, event_num=0, diffs=diffs, 
                                                                      add_points=add_points, peak_positions=[event_peak], positions=[add_points])
@@ -1059,8 +1125,8 @@ class EventDetection():
         return results
 
 
-    def detect_events(self, stride: int=None, eval: bool=False, resample_to_600: bool=True, peak_w: int=5, 
-                      rel_prom_cutoff: float=0.25, convolve_win: int=20, gradient_convolve_win: int=0) -> None:
+    def detect_events(self, stride: int=None, eval: bool=False, resample_to_600: bool=True, peak_w: int=5, rel_prom_cutoff: float=0.25, 
+                      filter_factor: float=20.0, convolve_win: int=0, gradient_convolve_win: int=0) -> None:
         '''
         Wrapper function to perform event detection, extraction and analysis
         
@@ -1077,18 +1143,21 @@ class EventDetection():
         rel_prom_cutoff: int, float = 0.25
             The relative prominence cutoff. Overlapping events are separated based on a peak-finding in the first derivative. To be considered
             an event, any detected peak must have at least 25% prominence of the largest detected prominence.
-        convolve_win: int, default = 20
-            Window size for the hanning window used to filter the data for event analysis.
+        filter_factor: float, default = 20
+            Filter factor for the lowpass filter used to filter the data for event analysis. Fraction of sampling rate (20 = 1/20 of sampling rate). 
+        convolve_win: int, default = 0
+            Window size for the hanning window used to filter the data for event analysis. If 0, no filtering is applied. Used for legacy compatibility.
         gradient_convolve_win: int, default = 0
             Window size for the hanning window used to filter the derivative for event analysis
         '''   
         self.peak_w = peak_w
         self.rel_prom_cutoff = rel_prom_cutoff
+        self.filter_factor = filter_factor
         self.convolve_win = convolve_win
         self.add_points = int(self.window_size / 3)
         
         self.stride_length = stride if stride else round(self.window_size / 30)
-        self.gradient_convolve_win = gradient_convolve_win if gradient_convolve_win else self.convolve_win * 2        
+        self.gradient_convolve_win = gradient_convolve_win
         self.resampling_factor = 600 / self.window_size if resample_to_600 else 1
         
         # Define peak spacer, i.e. number of points left / right of detected event peaks to use for amplitude calculation.
@@ -1108,6 +1177,8 @@ class EventDetection():
                                                                              rel_prom_cutoff=rel_prom_cutoff)
         self._remove_duplicate_locations()
 
+        self.slopes = self.smth_gradient[self.event_locations]
+
         if self.event_locations.shape[0] > 0:
             self._get_singular_event_indices()
             self.events = self.trace._extract_event_data(positions=self.event_locations, 
@@ -1122,7 +1193,9 @@ class EventDetection():
 
 
     def _get_average_event_decay(self) -> float:
-        ''' Returns the decay time constant of the averaged events '''
+        '''
+        Returns the decay time constant of the averaged events.
+        '''
         events_for_avg = self.events[self.singular_event_indices]
 
         event_x = np.arange(0, events_for_avg.shape[1]) * self.trace.sampling
@@ -1143,45 +1216,6 @@ class EventDetection():
             return np.full(3, np.nan)
 
 
-    def _fit_event(self, data: np.ndarray, amplitude: float=1, t_rise: float=1, t_decay: float=1, x_offset: float=1) -> dict:
-        '''
-        Performs a rudimentary fit to input event. If not starting values are provided, the data is fitted with
-        all starting values set to one.
-        
-        Parameters
-        ------
-        data: np.ndarray
-            The data to be fitted.
-        amplitude: float
-            Amplitude estimate
-        t_rise: float
-            Rise Tau estimate
-        t_decay: float
-            Decay Tau estimate
-        x_offset: float
-            Baseline period estimate
-
-        Returns
-        ------
-        results: dict
-            Dictionary containing the fitted parameters.
-        '''
-        x = np.arange(0, data.shape[0], dtype=float) * self.trace.sampling
-        try:
-            popt, _ = curve_fit(mEPSC_template, x, data, p0=[amplitude, t_rise, t_decay, x_offset], 
-                                bounds=([-np.inf, 0, 0, 0], [np.inf, 1e3, 1e3, self.window_size * self.trace.sampling]))
-        except RuntimeError:
-            popt = np.array([np.nan] * 4)
-        
-        results = {'amplitude':popt[0],
-                   'risetime':popt[1],
-                   't_decay':popt[2],
-                   'x_offset':popt[3]
-                   }
-        
-        return results
-
-
     def _eval_events(self) -> None:
         ''' Evaluates events. Calculates mean, std and median of amplitudes & charge, as well as decay tau and
         frequency of events. Results are stored as EventStats object in self.event_stats.
@@ -1198,17 +1232,69 @@ class EventDetection():
                                       tau=self.avg_decay_fit[1],
                                       charges=self.charges,
                                       risetimes=self.risetimes,
+                                      slopes=self.slopes,
                                       decaytimes=self.decaytimes,
+                                      halfwidths=self.halfwidths,
                                       time=self.trace.total_time,
                                       unit=self.trace.y_unit)
         
         self.event_peak_times = self.event_peak_locations * self.trace.sampling
         self.half_decay_times = self.half_decay * self.trace.sampling
         self.event_start_times = self.event_start * self.trace.sampling
-        self.interevent_intervals = np.diff(self.event_peak_times)
+        self.interevent_intervals = np.diff(self.event_peak_times, prepend=np.NaN)
 
         if self.verbose:
             self.event_stats.print()
+
+    
+    def delete_events(self, event_indices: list=[], eval: bool=True) -> None:
+        '''
+        Deletes events from the event list. The indices of the events to be deleted are passed as an array.
+
+        Parameters
+        ----------
+        event_indices: list
+            Indices of the events to be deleted.
+        eval: bool
+            Whether to re-evaluate the events after deletion. If False, the event statistics will not be updated.
+
+        Raises
+        ------
+        ValueError
+            When the event index does not exist.
+        '''
+        if not self.events_present():
+            return
+        
+        if not hasattr(self, 'event_stats'):
+            self._eval_events()
+
+        for event in event_indices:
+            if event < 0 or event >= self.event_locations.shape[0]:
+                raise ValueError(f'Event {event} does not exist.')
+
+        self.event_locations = np.delete(self.event_locations, event_indices, axis=0)
+        self.event_peak_locations = np.delete(self.event_peak_locations, event_indices, axis=0)
+        self.event_peak_times = np.delete(self.event_peak_times, event_indices, axis=0)
+        self.event_peak_values = np.delete(self.event_peak_values, event_indices, axis=0)
+        self.event_start = np.delete(self.event_start, event_indices, axis=0)
+        self.decaytimes = np.delete(self.decaytimes, event_indices, axis=0)
+        self.risetimes = np.delete(self.risetimes, event_indices, axis=0)
+        self.charges = np.delete(self.charges, event_indices, axis=0)
+        self.event_bsls = np.delete(self.event_bsls, event_indices, axis=0)
+        self.bsl_starts = np.delete(self.bsl_starts, event_indices, axis=0)
+        self.bsl_ends = np.delete(self.bsl_ends, event_indices, axis=0)
+        self.min_positions_rise = np.delete(self.min_positions_rise, event_indices, axis=0)
+        self.max_positions_rise = np.delete(self.max_positions_rise, event_indices, axis=0)
+        self.half_decay = np.delete(self.half_decay, event_indices, axis=0)
+        self.events = np.delete(self.events, event_indices, axis=0)
+        self.event_scores = np.delete(self.event_scores, event_indices, axis=0)
+        
+        self.deleted_events += len(event_indices)
+
+        if eval:
+            self.detection._get_singular_event_indices()
+            self.detection._eval_events()
 
 
     def save_to_h5(self, filename: str, include_prediction: bool=False) -> None:
@@ -1236,7 +1322,9 @@ class EventDetection():
             f.create_dataset('event_params/event_charges', data=self.event_stats.charges)
             f.create_dataset('event_params/event_risetimes', data=self.event_stats.risetimes)
             f.create_dataset('event_params/event_halfdecays', data=self.event_stats.halfdecays)
+            f.create_dataset('event_params/event_halfwidths', data=self.event_stats.halfwidths)
             f.create_dataset('event_params/event_bsls', data=np.array(self.event_bsls))
+            f.create_dataset('event_params/event_intervals', data=np.array(self.interevent_intervals))
             f.create_dataset('event_statistics/amplitude_average', data=self.event_stats.mean(self.event_stats.amplitudes))
             f.create_dataset('event_statistics/amplitude_stdev', data=self.event_stats.std(self.event_stats.amplitudes))
             f.create_dataset('event_statistics/amplitude_median', data=self.event_stats.median(self.event_stats.amplitudes))
@@ -1246,17 +1334,29 @@ class EventDetection():
             f.create_dataset('event_statistics/risetime_median', data=self.event_stats.median(self.event_stats.risetimes))
             f.create_dataset('event_statistics/decaytime_mean', data=self.event_stats.mean(self.event_stats.halfdecays))
             f.create_dataset('event_statistics/decaytime_median', data=self.event_stats.median(self.event_stats.halfdecays))
+            f.create_dataset('event_statistics/halfwidth_mean', data=self.event_stats.mean(self.event_stats.halfwidths))
+            f.create_dataset('event_statistics/halfwidth_median', data=self.event_stats.median(self.event_stats.halfwidths))
             f.create_dataset('event_statistics/decay_from_fit', data=self.event_stats.avg_tau_decay)
             f.create_dataset('event_statistics/frequency', data=self.event_stats.frequency())
+            f.create_dataset('event_statistics/iei_mean', data=self.event_stats.mean(self.interevent_intervals))
+            f.create_dataset('event_statistics/iei_median', data=self.event_stats.median(self.interevent_intervals))
 
             f.attrs['amplitude_unit'] = self.trace.y_unit
             f.attrs['recording_time'] = self.trace.data.shape[0] * self.trace.sampling
             f.attrs['source_filename'] = self.trace.filename
             f.attrs['miniml_model'] = self.model_path
             f.attrs['miniml_model_threshold'] = self.model_threshold
+            f.attrs['minimum_peak'] = self.peak_w
             f.attrs['stride'] = self.stride_length
             f.attrs['window'] = self.window_size
             f.attrs['event_direction'] = self.event_direction
+            if self.convolve_win > 0:
+                f.attrs['convolve_win'] = self.convolve_win
+            else:
+                f.attrs['filter_factor'] = self.filter_factor
+            f.attrs['gradient_convolve_win'] = self.gradient_convolve_win
+            f.attrs['relative_prominence'] = self.rel_prom_cutoff
+            f.attrs['deleted_events'] = self.deleted_events
 
             if include_prediction:
                 f.create_dataset('prediction', data=self.prediction)
@@ -1285,7 +1385,9 @@ class EventDetection():
             self.event_stats.amplitudes,
             self.event_stats.charges,
             self.event_stats.risetimes,
-            self.event_stats.halfdecays))
+            self.event_stats.halfdecays,
+            self.event_stats.halfwidths,
+            self.interevent_intervals))
         
         avgs = np.array((
             self.event_stats.mean(self.event_stats.amplitudes),
@@ -1294,13 +1396,15 @@ class EventDetection():
             self.event_stats.mean(self.event_stats.charges),
             self.event_stats.mean(self.event_stats.risetimes),
             self.event_stats.mean(self.event_stats.halfdecays),
+            self.event_stats.mean(self.event_stats.halfwidths),
             self.event_stats.avg_tau_decay,
-            self.event_stats.frequency()))
+            self.event_stats.frequency(),
+            self.event_stats.mean(self.interevent_intervals)))
         
         column_names = [f'event_{i}' for i in range(len(self.event_locations))]
 
-        individual = pd.DataFrame(individual, index=['location', 'score', 'amplitude', 'charge', 'risetime', 'decaytime'], columns=column_names)
-        avgs = pd.DataFrame(avgs, index=['amplitude mean', 'amplitude std', 'amplitude median', 'charge mean', 'risetime mean', 'decaytime mean', 'tau_avg', 'frequency'])
+        individual = pd.DataFrame(individual, index=['location', 'score', 'amplitude', 'charge', 'risetime', 'decaytime', 'halfwidth', 'interval'], columns=column_names)
+        avgs = pd.DataFrame(avgs, index=['amplitude mean', 'amplitude std', 'amplitude median', 'charge mean', 'risetime mean', 'decaytime mean', 'halfwidth mean', 'tau_avg', 'frequency', 'iei mean'], columns=['value'])
         
         individual.to_csv(f'{filename}_individual.csv')
         avgs.to_csv(f'{filename}_avgs.csv', header=False)
@@ -1345,7 +1449,9 @@ class EventDetection():
                 'amplitudes':self.event_stats.amplitudes,
                 'charges':self.event_stats.charges,
                 'risetimes':self.event_stats.risetimes,
-                'half_decaytimes':self.event_stats.halfdecays},            
+                'half_decaytimes':self.event_stats.halfdecays,
+                'event_intervals':self.interevent_intervals,            
+                'halfwidths':self.event_stats.halfwidths},
             
             'average_values':{
                 'amplitude mean':self.event_stats.mean(self.event_stats.amplitudes),
@@ -1354,8 +1460,11 @@ class EventDetection():
                 'charge mean':self.event_stats.mean(self.event_stats.charges),
                 'risetime mean':self.event_stats.mean(self.event_stats.risetimes),
                 'half_decaytime mean':self.event_stats.mean(self.event_stats.halfdecays),
+                'halfwidth mean':self.event_stats.mean(self.event_stats.halfwidths),
                 'decay_tau':self.event_stats.avg_tau_decay*1000,
-                'frequency':self.event_stats.frequency()},
+                'frequency':self.event_stats.frequency(),
+                'iei_mean':self.event_stats.mean(self.interevent_intervals),
+                'iei_median':self.event_stats.median(self.interevent_intervals)},
             
             'average_event_properties':self.average_event_properties,
             'metadata':{
@@ -1378,10 +1487,12 @@ class EventDetection():
 
                 ### event analysis params:
                 'convolve_win':self.convolve_win,
+                'filter_factor':self.filter_factor,
                 'gradient_convolve_win':self.gradient_convolve_win,
                 'min_peak_w':self.peak_w,
                 'rel_prom_cutoff':self.rel_prom_cutoff,
-                'event_direction':self.event_direction},
+                'event_direction':self.event_direction,
+                'deleted_events':self.deleted_events},
             'events':self.events}
 
         if include_prediction:
@@ -1411,8 +1522,10 @@ class EventAnalysis(EventDetection):
         Verbosity level
     event_positions: np.ndarray or list
         The position(s) of detected events.
+    filter_factor: int
+        Fraction of the sampling rate used to lowpass filter the data for analysis.
     convolve_win: int
-        The size of the Hann window for event analysis.
+        Window size for the hanning window used to filter the data for event analysis.
     resampling_factor: float
         The factor by which to resample the data.
 
@@ -1421,10 +1534,11 @@ class EventAnalysis(EventDetection):
     eval_events(): 
         Perform event analysis.
     '''
-    def __init__(self, trace, window_size, event_direction, verbose, event_positions, convolve_win, resampling_factor):
+    def __init__(self, trace, window_size, event_direction, verbose, event_positions, filter_factor, convolve_win, gradient_convolve_win, resampling_factor):
         super().__init__(data=trace, window_size=window_size, event_direction=event_direction, verbose=verbose)
         self.add_points = int(self.window_size/3)
         self.event_direction = event_direction
+        self.filter_factor = filter_factor
         self.convolve_win = convolve_win
         self.resampling_factor = resampling_factor
 
@@ -1434,7 +1548,7 @@ class EventAnalysis(EventDetection):
         self.event_locations = self.event_locations.astype(np.int64)
         self.events = self.trace._extract_event_data(self.event_locations, before=self.add_points, 
                                                      after=self.window_size + self.add_points)
-        self.convolve_win = convolve_win
+        self.gradeint_convolve_win = gradient_convolve_win
         
     def eval_events(self, filter: bool=True) -> None:
         if self.event_locations.shape[0] > 0:
