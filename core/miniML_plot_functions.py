@@ -54,7 +54,7 @@ class miniML_plots():
         plt.show()
 
         
-    def plot_event_overlay(self) -> None:
+    def plot_event_overlay(self, save_fig = '') -> None:
         '''
         plot the average event waveform overlayed on top of the individual events
         plus the fitted event.
@@ -65,17 +65,23 @@ class miniML_plots():
         events = self.detection.events[self.detection.singular_event_indices]
         event_x = np.arange(0, events.shape[1]) * self.detection.trace.sampling
         event_average = np.mean(events, axis=0)
-        event_fit = exp_fit(event_x[self.detection.avg_decay_fit_start:], *self.detection.avg_decay_fit) * self.detection.event_direction
-
         fig = plt.figure('Event average and fit')
+
         plt.plot(event_x, events.T, c=self.main_trace_color, alpha=0.3)
         plt.plot(event_x, event_average, c=self.red_color, linewidth='3', label='average event')
-        
-        plt.plot(event_x[self.detection.avg_decay_fit_start:], event_fit, c=self.orange_color, ls='--', label='fit')
+
+        # Handle cases where fitting failed.
+        try:
+            event_fit = exp_fit(event_x[self.detection.avg_decay_fit_start:], *self.detection.avg_decay_fit) * self.detection.event_direction
+            plt.plot(event_x[self.detection.avg_decay_fit_start:], event_fit, c=self.orange_color, ls='--', label='fit')
+        except AttributeError:
+            pass        
         
         plt.ylabel(f'{self.detection.trace.y_unit}')
         plt.xlabel('time (s)')
         plt.legend(loc='upper right')
+        if save_fig:
+            plt.savefig(save_fig)
         plt.show()
 
 
@@ -143,6 +149,7 @@ class miniML_plots():
             _ = plt.subplot(212, sharex=ax1)
             if plot_filtered_trace:
                 main_trace = self.detection.lowpass_filter(data=self.detection.trace.data, cutoff=self.detection.trace.sampling_rate / self.detection.filter_factor, order=4)
+                main_trace = self.detection.hann_filter(self.detection.trace.data, filter_size=self.detection.convolve_win)
                 plt.plot(self.detection.trace.time_axis, self.detection.trace.data, c='k', alpha=0.4)
 
             else:
@@ -182,12 +189,14 @@ class miniML_plots():
         plt.xlabel('time (s)')
         plt.legend(loc='upper right')
         if save_fig:
-            if not save_fig.endswith('.svg'):
-                save_fig = save_fig + '.svg'
-            plt.savefig(save_fig, format='svg')
-            plt.clf()
-            plt.close()
-            return
+            plt.savefig(save_fig)
+
+            # if not save_fig.endswith('.svg'):
+            #     save_fig = save_fig + '.svg'
+            # plt.savefig(save_fig, format='svg')
+            # plt.clf()
+            # plt.close()
+            # return
         plt.show()
 
         
